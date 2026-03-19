@@ -10,8 +10,8 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const FRONTIER_LOGIN_URL = "https://www.flyfrontier.com/myfrontier/login";
-const FRONTIER_ACCOUNT_URL = "https://www.flyfrontier.com/myfrontier/my-account";
+const FRONTIER_HOME_URL = "https://www.flyfrontier.com/";
+const FRONTIER_FAQ_URL = "https://faq.flyfrontier.com/help";
 
 // Store browser instance for login flow
 let loginBrowser: Browser | null = null;
@@ -56,14 +56,14 @@ export function hasCookies(): boolean {
       // Still return true but log warning - actual validation will happen on use
     }
     
-    // Check if essential cookies exist
-    const hasSessionCookie = parsed.cookies.some(
-      (c) => c.domain.includes("flyfrontier.com") && (c.name.includes("session") || c.name.includes("auth") || c.name.includes("token"))
+    const usableFrontierCookies = parsed.cookies.filter(
+      (c) =>
+        c.domain.includes("flyfrontier.com") &&
+        !/^(_px|pxcts|_gcl_)/i.test(c.name)
     );
-    
-    if (!hasSessionCookie) {
-      // Still might work with other cookies, just log it
-      console.log("[Playwright] Warning: No obvious session cookie found");
+
+    if (usableFrontierCookies.length === 0) {
+      console.log("[Playwright] Warning: No non-tracking Frontier cookies found");
     }
     
     return true;
@@ -122,14 +122,12 @@ export function deleteCookies(): void {
  * Returns when the browser is ready for user interaction
  */
 export async function startLoginFlow(): Promise<{ status: string }> {
-  // Close any existing login browser
   if (loginBrowser) {
     await loginBrowser.close();
     loginBrowser = null;
     loginPage = null;
   }
 
-  // Launch headed browser for manual login
   loginBrowser = await chromium.launch({
     headless: false,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
@@ -143,8 +141,38 @@ export async function startLoginFlow(): Promise<{ status: string }> {
 
   loginPage = await context.newPage();
 
-  // Navigate to Frontier login page
-  await loginPage.goto(FRONTIER_LOGIN_URL, { waitUntil: "networkidle" });
+  // Open a live Frontier page
+  await loginPage.goto(FRONTIER_HOME_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+  // Try a few possible sign-in triggers
+  const loginTriggers = [
+    'text=/sign in/i',
+    'text=/my trips/i',
+    'text=/frontier miles/i',
+    '[aria-label*="sign" i]',
+    'button:has-text("Sign In")',
+    'a:has-text("Sign In")',
+  ];
+
+  let clicked = false;
+  for (const selector of loginTriggers) {
+    try {
+      const el = loginPage.locator(selector).first();
+      if (await el.isVisible({ timeout: 3000 })) {
+        console.log("[Playwright] Clicking login trigger:", selector);
+        await el.click();
+        clicked = true;
+        break;
+      }
+    } catch {}
+  }
+
+  if (!clicked) {
+    return { status: "waiting_for_login_manual_navigation" };
+  }
+
+  // Wait for the sidebar/modal fields to appear
+  await loginPage.waitForSelector('input[type="password"]', { timeout: 15000 });
 
   return { status: "waiting_for_login" };
 }
@@ -161,29 +189,72 @@ export async function checkLoginStatus(): Promise<{
   }
 
   try {
-    const url = loginPage.url();
+    const context = loginPage.context();
+    const cookies = await context.cookies();
 
-    // Check if we're on the account page or have been redirected from login
-    const isLoggedIn =
-      url.includes("/myfrontier/my-account") ||
-      url.includes("/myfrontier/dashboard") ||
-      (url.includes("flyfrontier.com") && !url.includes("/login"));
+    // Print cookie names once for debugging
+    console.log(
+      "[Playwright] Cookies after login attempt:",
+      cookies.map((c) => `${c.domain} :: ${c.name}`)
+    );
 
-    // Also check for logged-in indicators on the page
-    if (isLoggedIn) {
-      // Save cookies
-      const context = loginPage.context();
-      await saveCookies(context);
+    const frontierCookies = cookies.filter((c) =>
+      c.domain.includes("flyfrontier.com")
+    );
 
-      // Close the browser
-      await loginBrowser.close();
-      loginBrowser = null;
-      loginPage = null;
-
-      return { status: "logged_in", message: "Login successful! Cookies saved." };
+    if (frontierCookies.length === 0) {
+      return { status: "waiting", message: "No Frontier cookies detected yet" };
     }
 
-    return { status: "waiting", message: "Please log in to Frontier in the browser window" };
+    const nonTrackingCookies = frontierCookies.filter(
+      (c) => !/^(_px|pxcts|_gcl_)/i.test(c.name)
+    );
+
+    console.log(
+      "[Playwright] Non-tracking Frontier cookies:",
+      nonTrackingCookies.map((c) => `${c.domain} :: ${c.name}`)
+    );
+
+    if (nonTrackingCookies.length === 0) {
+      return {
+        status: "waiting",
+        message: "Only tracking/bot cookies detected so far; waiting for real session state",
+      };
+    }
+
+    console.log("[Playwright] Current login page URL:", loginPage.url());
+
+    const pageText = await loginPage.locator("body").innerText().catch(() => "");
+
+    // Require stronger proof of login, not just generic site text
+    const hasStrongLoggedInUi =
+      /log out|logout|my account|sign out|profile|manage trips/i.test(pageText);
+
+    // Also reject obvious logged-out/login-drawer states
+    const stillShowsLoginForm =
+      /login to frontier miles|email address or frontier miles|forgot password/i.test(pageText);
+
+    if (stillShowsLoginForm) {
+      return {
+        status: "waiting",
+        message: "Login form still visible. Please finish logging in in the Frontier browser window",
+      };
+    }
+
+    if (!hasStrongLoggedInUi) {
+      return {
+        status: "waiting",
+        message: "Waiting for a confirmed logged-in Frontier page",
+      };
+    }
+
+    await saveCookies(context);
+
+    await loginBrowser.close();
+    loginBrowser = null;
+    loginPage = null;
+
+    return { status: "logged_in", message: "Login successful! Cookies saved." };
   } catch (error) {
     return {
       status: "error",
@@ -251,15 +322,27 @@ export async function validateSession(): Promise<{
     browser = auth.browser;
     const page = auth.page;
 
-    // Try to access account page
-    await page.goto(FRONTIER_ACCOUNT_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(FRONTIER_HOME_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
 
-    const url = page.url();
+    const cookies = await page.context().cookies();
+    const frontierCookies = cookies.filter((c) =>
+      c.domain.includes("flyfrontier.com")
+    );
 
-    // If redirected to login, session is invalid
-    if (url.includes("/login")) {
-      deleteCookies();
-      return { valid: false, message: "Session expired. Please log in again." };
+    if (frontierCookies.length === 0) {
+      //deleteCookies();
+      return { valid: false, message: "No Frontier session cookies found." };
+    }
+
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const looksLoggedOut = /sign in|log in/i.test(bodyText) && !/log out|my account/i.test(bodyText);
+
+    if (looksLoggedOut) {
+      //deleteCookies();
+      return { valid: false, message: "Session appears logged out. Please log in again." };
     }
 
     return { valid: true, message: "Session is valid" };
